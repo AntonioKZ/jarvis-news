@@ -19,7 +19,9 @@ const TOPICS = [
 type TopicId = (typeof TOPICS)[number]["id"];
 type Article = { id: string; title: string; source: string; link: string; published: string; topic: TopicId | "custom"; description: string };
 type Preferences = { topics: TopicId[]; keywords: string; rate: number; voice: string; autoNext: boolean };
-type Recognition = { lang: string; onresult: ((event: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void) | null; onerror: (() => void) | null; onend: (() => void) | null; start: () => void; stop: () => void };
+type Recognition = { lang: string; interimResults: boolean; onstart: (() => void) | null; onresult: ((event: { results: ArrayLike<{ 0: { transcript: string }; length: number; isFinal: boolean }> }) => void) | null; onerror: ((event: { error?: string }) => void) | null; onend: (() => void) | null; start: () => void; stop: () => void };
+type Phase = "idle" | "listening" | "recognized" | "finding" | "reading" | "summarizing" | "speaking" | "done" | "error";
+type Insight = { article: Article; points?: string[]; message?: string; sourceUrl?: string; coverage?: string };
 const DEFAULTS: Preferences = { topics: ["ai", "engineering", "software", "semiconductors", "energy", "funding"], keywords: "", rate: 1, voice: "", autoNext: true };
 const STORE = "jarvis-news-preferences-v1";
 
@@ -29,6 +31,14 @@ function relativeTime(value: string) {
   if (hours < 1) return "Meno di 1 ora fa";
   if (hours < 24) return `${hours} ${hours === 1 ? "ora" : "ore"} fa`;
   return new Intl.DateTimeFormat("it-IT", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }).format(new Date(value));
+}
+const PHASE_LABELS: Record<Phase, string> = { idle: "PRONTO", listening: "TI ASCOLTO", recognized: "COMANDO RICEVUTO", finding: "CERCO LA FONTE", reading: "LEGGO LA FONTE", summarizing: "PREPARO LA SINTESI", speaking: "JARVIS PARLA", done: "COMPLETATO", error: "ATTENZIONE" };
+function VoiceScope({ phase }: { phase: Phase }) {
+  return <div className={`voice-scope scope-${phase}`} role="img" aria-label={`Indicatore vocale: ${PHASE_LABELS[phase]}`}>
+    <div className="scope-grid"/><div className="scope-center"/>
+    <div className="scope-bars" aria-hidden="true">{Array.from({ length: 35 }, (_, i) => <i key={i} style={{ animationDelay: `${(i * 37) % 780}ms`, height: `${12 + Math.round((Math.sin(i * .73) + 1) * 22)}%` }}/>)}</div>
+    <span className="scope-caption">{phase === "listening" ? "INGRESSO VOCALE" : phase === "speaking" ? "USCITA VOCALE" : "JARVIS / SIGNAL"}</span>
+  </div>;
 }
 
 export default function Home() {
@@ -44,11 +54,15 @@ export default function Home() {
   const [paused, setPaused] = useState(false);
   const [playingIndex, setPlayingIndex] = useState<number | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [deepening, setDeepening] = useState(false);
-  const [insight, setInsight] = useState<{ article: Article; overview?: string[]; message?: string } | null>(null);
-  const [listening, setListening] = useState(false);
+  const [phase, setPhase] = useState<Phase>("idle");
+  const [phaseDetail, setPhaseDetail] = useState("Scegli una notizia o avvia il briefing.");
+  const [insight, setInsight] = useState<Insight | null>(null);
+  const [transcript, setTranscript] = useState("");
+  const [selectedArticle, setSelectedArticle] = useState<Article | null>(null);
   const currentArticle = useRef<Article | null>(null);
   const recognition = useRef<Recognition | null>(null);
+  const commandArticle = useRef<Article | null>(null);
+  const requestToken = useRef(0);
   const playToken = useRef(0);
   const nextRef = useRef<() => void>(() => {});
 
@@ -110,62 +124,99 @@ export default function Home() {
   }, [ready, loadNews]);
 
   const visible = active === "all" ? articles : articles.filter(a => a.topic === active);
-  const stop = () => { playToken.current++; window.speechSynthesis?.cancel(); setSpeaking(false); setPaused(false); setPlayingIndex(null); };
+  const stopSpeech = () => { playToken.current++; window.speechSynthesis?.cancel(); setSpeaking(false); setPaused(false); setPlayingIndex(null); };
+  const stop = () => { stopSpeech(); setPhase("idle"); setPhaseDetail("Riproduzione fermata."); };
+  const speakText = (words: string) => {
+    if (!("speechSynthesis" in window)) { setPhase("done"); setPhaseDetail("Sintesi pronta da leggere sullo schermo."); return; }
+    const token = ++playToken.current;
+    const utterance = new SpeechSynthesisUtterance(words);
+    utterance.lang = "it-IT"; utterance.rate = prefs.rate;
+    utterance.voice = voices.find(v => v.voiceURI === prefs.voice) || voices.find(v => v.lang.toLowerCase().startsWith("it")) || null;
+    utterance.onstart = () => { if (token === playToken.current) { setPhase("speaking"); setPhaseDetail("Jarvis legge la sintesi della fonte."); setSpeaking(true); } };
+    utterance.onend = () => { if (token === playToken.current) { setPhase("done"); setPhaseDetail("Sintesi completata. Puoi verificare la fonte dal link."); setSpeaking(false); } };
+    utterance.onerror = () => { if (token === playToken.current) { setPhase("done"); setPhaseDetail("Sintesi visibile; la voce non è disponibile."); setSpeaking(false); } };
+    window.speechSynthesis.speak(utterance);
+  };
   const deepen = async (article: Article | null) => {
-    if (!article) { setError("Avvia un briefing o scegli una notizia da approfondire."); return; }
-    stop(); currentArticle.current = article; setInsight(null); setDeepening(true);
+    if (!article) { setPhase("error"); setPhaseDetail("Scegli una notizia prima di chiedere l'approfondimento."); return; }
+    const token = ++requestToken.current;
+    stopSpeech(); currentArticle.current = article; setSelectedArticle(article); setInsight(null);
+    setPhase("finding"); setPhaseDetail("Cerco l'articolo originale…");
     try {
-      const response = await fetch("/api/deepen", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ link: article.link }) });
-      const data = await response.json() as { overview?: string[]; error?: string };
-      setInsight({ article, overview: data.overview, message: data.error });
-      const words = data.overview?.join(" ") || data.error;
-      if (words && "speechSynthesis" in window) {
-        const utterance = new SpeechSynthesisUtterance(words);
-        utterance.lang = "it-IT"; utterance.rate = prefs.rate;
-        utterance.voice = voices.find(v => v.voiceURI === prefs.voice) || voices.find(v => v.lang.toLowerCase().startsWith("it")) || null;
-        window.speechSynthesis.speak(utterance);
+      const response = await fetch("/api/deepen", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ link: article.link, title: article.title, source: article.source }) });
+      if (!response.ok || !response.body) throw new Error("Il servizio di approfondimento non risponde.");
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let pending = "";
+      const receive = (line: string) => {
+        if (!line.trim() || token !== requestToken.current) return;
+        const event = JSON.parse(line) as { phase: Phase; detail: string; error?: string; result?: { points: string[]; sourceUrl: string; coverage: string } };
+        setPhase(event.phase); setPhaseDetail(event.error || event.detail);
+        if (event.error) setInsight({ article, message: event.error });
+        if (event.result) {
+          setInsight({ article, points: event.result.points, sourceUrl: event.result.sourceUrl, coverage: event.result.coverage });
+          speakText(`Ecco i punti principali della notizia. ${event.result.points.join(" ")} Per verificare, trovi il link alla fonte originale sullo schermo.`);
+        }
+      };
+      while (true) {
+        const { value, done } = await reader.read();
+        pending += decoder.decode(value || new Uint8Array(), { stream: !done });
+        const lines = pending.split("\n"); pending = lines.pop() || "";
+        lines.forEach(receive);
+        if (done) { receive(pending); break; }
       }
-    } catch { setInsight({ article, message: "Non riesco a raggiungere la fonte. Apri l'articolo originale." }); }
-    finally { setDeepening(false); }
+    } catch (error) {
+      if (token !== requestToken.current) return;
+      const message = error instanceof Error ? error.message : "Fonte non disponibile.";
+      setPhase("error"); setPhaseDetail(message); setInsight({ article, message });
+    }
   };
   const listen = () => {
-    if (listening) { recognition.current?.stop(); return; }
+    if (phase === "listening") { recognition.current?.stop(); return; }
     const browser = window as Window & { SpeechRecognition?: new () => Recognition; webkitSpeechRecognition?: new () => Recognition };
     const Constructor = browser.SpeechRecognition || browser.webkitSpeechRecognition;
-    if (!Constructor) { setError("Il riconoscimento vocale non è disponibile in questo browser. Usa il pulsante Approfondisci."); return; }
-    const article = currentArticle.current || (playingIndex !== null ? visible[playingIndex] : null);
-    stop();
-    const mic = new Constructor(); recognition.current = mic; mic.lang = "it-IT";
+    if (!Constructor) { setPhase("error"); setPhaseDetail("Questo browser non supporta il riconoscimento vocale. Tocca Approfondisci sulla notizia."); return; }
+    commandArticle.current = currentArticle.current || selectedArticle || visible[0] || null;
+    stopSpeech(); setTranscript(""); setPhase("listening"); setPhaseDetail("Microfono in avvio: pronuncia «approfondisci questa notizia».");
+    const mic = new Constructor(); recognition.current = mic; mic.lang = "it-IT"; mic.interimResults = true;
+    let recognized = false;
+    mic.onstart = () => { setPhase("listening"); setPhaseDetail("Ti ascolto. Pronuncia il comando adesso."); };
     mic.onresult = event => {
-      const command = event.results[0]?.[0]?.transcript.toLowerCase() || "";
-      if (/approfond|dimmi di pi[uù]|spiega/.test(command)) void deepen(article);
-      else setError(`Comando «${command}» non riconosciuto. Di': approfondisci questa notizia.`);
+      const result = event.results[event.results.length - 1];
+      const command = result?.[0]?.transcript.trim() || "";
+      setTranscript(command);
+      if (!result?.isFinal || recognized) return;
+      recognized = true;
+      setPhase("recognized"); setPhaseDetail(`Ho capito: «${command}».`);
+      mic.stop();
+      if (/approfond|dimmi di pi[uù]|spiega|riassum/.test(command.toLocaleLowerCase("it"))) void deepen(commandArticle.current);
+      else { setPhase("error"); setPhaseDetail(`Comando «${command}» non riconosciuto. Riprova dicendo «approfondisci questa notizia».`); }
     };
-    mic.onerror = () => setError("Microfono non disponibile o permesso negato.");
-    mic.onend = () => { setListening(false); recognition.current = null; };
-    try { mic.start(); setListening(true); } catch { setError("Impossibile avviare il microfono."); }
+    mic.onerror = event => { if (!recognized) { setPhase("error"); setPhaseDetail(event.error === "not-allowed" ? "Permesso microfono negato. Abilitalo nelle impostazioni del browser." : `Ascolto non riuscito (${event.error || "errore"}). Riprova o usa Approfondisci.`); } };
+    mic.onend = () => { recognition.current = null; if (!recognized) setPhase(previous => { if (previous === "listening") { setPhaseDetail("Non ho sentito un comando. Tocca il microfono e riprova."); return "error"; } return previous; }); };
+    try { mic.start(); } catch { setPhase("error"); setPhaseDetail("Impossibile avviare il microfono. Usa il pulsante Approfondisci."); }
   };
   const speak = (index: number, items = visible) => {
     if (!("speechSynthesis" in window) || !items[index]) return;
     window.speechSynthesis.cancel();
     const token = ++playToken.current;
     const item = items[index];
-    currentArticle.current = item;
+    currentArticle.current = item; setSelectedArticle(item); setInsight(null);
     const description = item.description.trim();
     const duplicate = description.toLocaleLowerCase("it").replace(/[^\p{L}\p{N}]/gu, "").startsWith(item.title.toLocaleLowerCase("it").replace(/[^\p{L}\p{N}]/gu, ""));
     const utterance = new SpeechSynthesisUtterance(`${item.title}. Fonte: ${item.source}.${description && !duplicate ? ` ${description}` : ""}`);
     utterance.lang = "it-IT"; utterance.rate = prefs.rate;
     const selected = voices.find(v => v.voiceURI === prefs.voice) || voices.find(v => v.lang.toLowerCase().startsWith("it"));
     if (selected) utterance.voice = selected;
-    utterance.onstart = () => { if (token === playToken.current) { setSpeaking(true); setPaused(false); setPlayingIndex(index); } };
-    utterance.onend = () => { if (token !== playToken.current) return; if (prefs.autoNext && index + 1 < items.length) nextRef.current(); else { setSpeaking(false); setPlayingIndex(null); } };
-    utterance.onerror = () => { if (token === playToken.current) { setSpeaking(false); setPlayingIndex(null); } };
+    utterance.onstart = () => { if (token === playToken.current) { setSpeaking(true); setPaused(false); setPlayingIndex(index); setPhase("speaking"); setPhaseDetail(`Notizia ${index + 1} di ${items.length}. Tocca il microfono per interrompermi.`); } };
+    utterance.onend = () => { if (token !== playToken.current) return; if (prefs.autoNext && index + 1 < items.length) nextRef.current(); else { setSpeaking(false); setPlayingIndex(null); setPhase("done"); setPhaseDetail("Briefing completato."); } };
+    utterance.onerror = () => { if (token === playToken.current) { setSpeaking(false); setPlayingIndex(null); setPhase("error"); setPhaseDetail("Riproduzione vocale non riuscita."); } };
     nextRef.current = () => speak(index + 1, items);
     window.speechSynthesis.speak(utterance);
   };
   const togglePlayback = () => {
-    if (speaking && paused) { window.speechSynthesis.resume(); setPaused(false); }
-    else if (speaking) { window.speechSynthesis.pause(); setPaused(true); }
+    if (speaking && paused) { window.speechSynthesis.resume(); setPaused(false); setPhase("speaking"); }
+    else if (speaking) { window.speechSynthesis.pause(); setPaused(true); setPhase("idle"); setPhaseDetail("Briefing in pausa."); }
     else speak(0);
   };
   const toggleTopic = (id: TopicId) => setPrefs(p => ({ ...p, topics: p.topics.includes(id) ? p.topics.filter(x => x !== id) : [...p.topics, id] }));
@@ -193,9 +244,22 @@ export default function Home() {
         {loading && !articles.length ? <div className="loading-card"><span className="spin-circle"/>Cerco notizie dalle fonti…</div> : null}
         {!loading && !visible.length ? <div className="empty-card"><Activity size={28}/><strong>Nessuna notizia da mostrare</strong><p>Modifica i canali o riprova l’aggiornamento.</p></div> : null}
         <div className="article-list">{visible.map((a, index) => <article className={`article ${playingIndex === index && speaking ? "article-playing" : ""}`} key={a.id}><div className="article-meta"><span className="topic-label">{a.topic === "custom" ? "PERSONALE" : TOPICS.find(t => t.id === a.topic)?.short.toUpperCase()}</span><span className="meta-separator"/> {a.source} <span className="meta-separator"/><Clock3 size={13}/>{relativeTime(a.published)}</div><a className="article-title" href={a.link} target="_blank" rel="noopener noreferrer">{a.title}<ArrowUpRight size={17}/></a>{a.description && !a.description.toLocaleLowerCase("it").replace(/[^\p{L}\p{N}]/gu, "").startsWith(a.title.toLocaleLowerCase("it").replace(/[^\p{L}\p{N}]/gu, "")) && <p>{a.description}</p>}<div className="article-actions"><button onClick={() => speak(index)}><Volume2 size={15}/> Ascolta</button><button onClick={() => void deepen(a)}>Approfondisci</button><a href={a.link} target="_blank" rel="noopener noreferrer">Apri la fonte <ArrowUpRight size={14}/></a></div></article>)}</div>
-        {insight && <div className="insight-card" role="status"><strong>{insight.article.title}</strong>{insight.overview ? <><small>Punti estratti dal testo accessibile della fonte</small>{insight.overview.map((point, i) => <p key={i}>{point}</p>)}</> : <p>{insight.message}</p>}<a href={insight.article.link} target="_blank" rel="noopener noreferrer">Leggi l'articolo originale <ArrowUpRight size={14}/></a></div>}
+
       </section>
-      <aside className="briefing-panel"><div className="panel-top"><div className="eyebrow">JARVIS AUDIO</div><span className="audio-status"><span className="live-pulse"/> {listening ? "TI ASCOLTO" : deepening ? "LEGGO LA FONTE" : speaking ? paused ? "IN PAUSA" : "IN RIPRODUZIONE" : "PRONTO"}</span></div><div className={`orb-wrap ${speaking && !paused ? "orb-speaking" : ""}`}><div className="orb-ring ring-outer"/><div className="orb-ring ring-inner"/><div className="orb"><AudioLines size={38} strokeWidth={1.5}/></div></div><h2>Il briefing<br/><em>si ascolta.</em></h2><p className="panel-copy">{first ? `Inizia dalle ${visible.length} notizie ${active === "all" ? "dei tuoi canali" : "di questo canale"}. La voce legge titolo e fonte.` : "Seleziona un canale con notizie disponibili per iniziare."}</p><div className="player-controls"><button className="play-button" disabled={!first || !(typeof window !== "undefined" && "speechSynthesis" in window)} onClick={togglePlayback}>{speaking && !paused ? <Pause size={18} fill="currentColor"/> : <Play size={18} fill="currentColor"/>}<span>{speaking && !paused ? "Metti in pausa" : paused ? "Riprendi" : "Ascolta il briefing"}</span></button><button className="stop-button" disabled={!speaking} aria-label="Ferma ascolto" onClick={stop}><Square size={16}/></button></div><button className="voice-command" onClick={listen} disabled={!currentArticle.current && !speaking}><Mic size={16}/>{listening ? "Ascolto…" : "Parla a Jarvis"}</button><p className="voice-hint">Tocca il microfono durante il briefing e di': «approfondisci questa notizia».</p><div className="player-note"><Headphones size={16}/> Voce del tuo browser · impostazioni personalizzabili</div><div className="panel-bottom"><span>PROSSIMA NOTIZIA</span><strong>{speaking && playingIndex !== null ? visible[playingIndex + 1]?.title || "Fine del briefing" : first?.title || "In attesa di notizie"}</strong></div></aside></div>
+      <aside className="briefing-panel" aria-live="polite">
+        <div className="panel-top"><div className="eyebrow">JARVIS AUDIO</div><span className={`audio-status status-${phase}`}><span className="live-pulse"/> {PHASE_LABELS[phase]}</span></div>
+        <VoiceScope phase={phase}/>
+        <div className="activity-status" role="status"><strong>{PHASE_LABELS[phase]}</strong><p>{phaseDetail}</p>{transcript && <small>Hai detto: «{transcript}»</small>}</div>
+        <h2>Ascolta. <em>Chiedi.</em><br/>Approfondisci.</h2>
+        <p className="panel-copy">{selectedArticle ? `Notizia selezionata: ${selectedArticle.title}` : first ? `Pronto a leggere ${visible.length} notizie. Premi Ascolta o seleziona un articolo.` : "Seleziona un canale con notizie disponibili."}</p>
+        <div className="player-controls"><button className="play-button" disabled={!first || !(typeof window !== "undefined" && "speechSynthesis" in window)} onClick={togglePlayback}>{speaking && !paused ? <Pause size={18} fill="currentColor"/> : <Play size={18} fill="currentColor"/>}<span>{speaking && !paused ? "Metti in pausa" : paused ? "Riprendi" : "Ascolta il briefing"}</span></button><button className="stop-button" disabled={!speaking} aria-label="Ferma ascolto" onClick={stop}><Square size={16}/></button></div>
+        <button className="voice-command" onClick={listen} disabled={!first}><Mic size={17}/>{phase === "listening" ? "Ferma ascolto" : "Parla a Jarvis"}</button>
+        <button className="detail-command" onClick={() => void deepen(currentArticle.current || selectedArticle || first || null)} disabled={!first || ["finding","reading","summarizing"].includes(phase)}>Approfondisci la notizia selezionata</button>
+        <p className="voice-hint">Tocca il microfono, attendi «TI ASCOLTO» e di': «approfondisci questa notizia».</p>
+        {insight && <div className="insight-card" role="status"><strong>{insight.article.title}</strong>{insight.points ? <><small>{insight.coverage}</small>{insight.points.map((point, i) => <p key={i}>{point}</p>)}</> : <p>{insight.message}</p>}<a href={insight.sourceUrl || insight.article.link} target="_blank" rel="noopener noreferrer">Verifica sulla fonte originale <ArrowUpRight size={14}/></a></div>}
+        <div className="player-note"><Headphones size={16}/> Voce e microfono dipendono dal browser · autorizza il microfono quando richiesto</div>
+        <div className="panel-bottom"><span>PROSSIMA NOTIZIA</span><strong>{speaking && playingIndex !== null ? visible[playingIndex + 1]?.title || "Fine del briefing" : first?.title || "In attesa di notizie"}</strong></div>
+      </aside></div>
     </main><footer className="footer"><span>JARVIS / NEWS</span><span>Le notizie provengono da fonti esterne. Apri la fonte per leggere l’articolo completo.</span></footer>
   </div>;
 }
