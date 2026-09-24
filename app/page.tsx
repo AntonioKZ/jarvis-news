@@ -20,7 +20,7 @@ type TopicId = (typeof TOPICS)[number]["id"];
 type Article = { id: string; title: string; source: string; link: string; published: string; topic: TopicId | "custom"; description: string };
 type Preferences = { topics: TopicId[]; keywords: string; rate: number; voice: string; autoNext: boolean };
 type Recognition = { lang: string; interimResults: boolean; onstart: (() => void) | null; onresult: ((event: { results: ArrayLike<{ 0: { transcript: string }; length: number; isFinal: boolean }> }) => void) | null; onerror: ((event: { error?: string }) => void) | null; onend: (() => void) | null; start: () => void; stop: () => void };
-type Phase = "idle" | "listening" | "recognized" | "finding" | "reading" | "summarizing" | "speaking" | "done" | "error";
+type Phase = "idle" | "acknowledging" | "listening" | "recognized" | "finding" | "reading" | "summarizing" | "speaking" | "done" | "error";
 type Insight = { article: Article; points?: string[]; message?: string; sourceUrl?: string; coverage?: string };
 const DEFAULTS: Preferences = { topics: ["ai", "engineering", "software", "semiconductors", "energy", "funding"], keywords: "", rate: 1, voice: "", autoNext: true };
 const STORE = "jarvis-news-preferences-v1";
@@ -32,12 +32,56 @@ function relativeTime(value: string) {
   if (hours < 24) return `${hours} ${hours === 1 ? "ora" : "ore"} fa`;
   return new Intl.DateTimeFormat("it-IT", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }).format(new Date(value));
 }
-const PHASE_LABELS: Record<Phase, string> = { idle: "PRONTO", listening: "TI ASCOLTO", recognized: "COMANDO RICEVUTO", finding: "CERCO LA FONTE", reading: "LEGGO LA FONTE", summarizing: "PREPARO LA SINTESI", speaking: "JARVIS PARLA", done: "COMPLETATO", error: "ATTENZIONE" };
-function VoiceScope({ phase }: { phase: Phase }) {
+const PHASE_LABELS: Record<Phase, string> = { idle: "PRONTO", acknowledging: "ATTIVO IL MICROFONO", listening: "TI ASCOLTO", recognized: "COMANDO RICEVUTO", finding: "CERCO LA FONTE", reading: "LEGGO LA FONTE", summarizing: "PREPARO LA SINTESI", speaking: "JARVIS PARLA", done: "COMPLETATO", error: "ATTENZIONE" };
+function VoiceScope({ phase, micStream }: { phase: Phase; micStream: MediaStream | null }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    let frame = 0;
+    let audio: AudioContext | null = null;
+    let analyser: AnalyserNode | null = null;
+    let samples: Uint8Array<ArrayBuffer> | null = null;
+    if (phase === "listening" && micStream && typeof AudioContext !== "undefined") {
+      audio = new AudioContext();
+      const source = audio.createMediaStreamSource(micStream);
+      analyser = audio.createAnalyser(); analyser.fftSize = 512; source.connect(analyser);
+      samples = new Uint8Array(new ArrayBuffer(analyser.fftSize));
+    }
+    const draw = (time: number) => {
+      const { width, height } = canvas.getBoundingClientRect();
+      const ratio = Math.min(window.devicePixelRatio || 1, 2);
+      if (canvas.width !== Math.round(width * ratio) || canvas.height !== Math.round(height * ratio)) {
+        canvas.width = Math.round(width * ratio); canvas.height = Math.round(height * ratio);
+      }
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      const color = phase === "listening" ? "#8affce" : phase === "error" ? "#fa9c82" : "#64e9ec";
+      const live = phase === "listening" && analyser && samples;
+      if (live) analyser!.getByteTimeDomainData(samples!);
+      ctx.beginPath();
+      for (let x = 0; x <= width; x += 2) {
+        const index = Math.min(511, Math.floor(x / Math.max(width, 1) * 512));
+        const signal = live ? (samples![index] - 128) / 128 :
+          phase === "speaking" || phase === "acknowledging" ? Math.sin(x * .095 - time * .012) * Math.sin(x * .026 + time * .004) * .56 :
+          ["finding", "reading", "summarizing"].includes(phase) ? Math.sin(x * .09 - time * .008) * .16 : Math.sin(x * .05 - time * .001) * .025;
+        const y = height / 2 + signal * height * .37;
+        if (!x) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.strokeStyle = color; ctx.lineWidth = 2.5; ctx.shadowColor = color; ctx.shadowBlur = 16; ctx.stroke();
+      ctx.shadowBlur = 0;
+      if (phase === "listening" || phase === "speaking" || phase === "acknowledging") frame = requestAnimationFrame(draw);
+      else frame = requestAnimationFrame(draw);
+    };
+    frame = requestAnimationFrame(draw);
+    return () => { cancelAnimationFrame(frame); if (audio) void audio.close(); };
+  }, [phase, micStream]);
   return <div className={`voice-scope scope-${phase}`} role="img" aria-label={`Indicatore vocale: ${PHASE_LABELS[phase]}`}>
     <div className="scope-grid"/><div className="scope-center"/>
-    <div className="scope-bars" aria-hidden="true">{Array.from({ length: 35 }, (_, i) => <i key={i} style={{ animationDelay: `${(i * 37) % 780}ms`, height: `${12 + Math.round((Math.sin(i * .73) + 1) * 22)}%` }}/>)}</div>
-    <span className="scope-caption">{phase === "listening" ? "INGRESSO VOCALE" : phase === "speaking" ? "USCITA VOCALE" : "JARVIS / SIGNAL"}</span>
+    <canvas ref={canvasRef} className="scope-canvas" aria-hidden="true"/>
+    <span className="scope-caption">{phase === "listening" ? micStream ? "INGRESSO MICROFONO · SEGNALE REALE" : "INGRESSO VOCALE" : phase === "speaking" ? "USCITA VOCALE · INDICATORE" : "JARVIS / SIGNAL"}</span>
   </div>;
 }
 
@@ -59,12 +103,16 @@ export default function Home() {
   const [insight, setInsight] = useState<Insight | null>(null);
   const [transcript, setTranscript] = useState("");
   const [selectedArticle, setSelectedArticle] = useState<Article | null>(null);
+  const [micStream, setMicStream] = useState<MediaStream | null>(null);
   const currentArticle = useRef<Article | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
   const recognition = useRef<Recognition | null>(null);
   const commandArticle = useRef<Article | null>(null);
   const requestToken = useRef(0);
+  const captureToken = useRef(0);
   const playToken = useRef(0);
   const nextRef = useRef<() => void>(() => {});
+  const releaseMic = () => { micStreamRef.current?.getTracks().forEach(track => track.stop()); micStreamRef.current = null; setMicStream(null); };
 
   useEffect(() => {
     try {
@@ -172,29 +220,62 @@ export default function Home() {
     }
   };
   const listen = () => {
-    if (phase === "listening") { recognition.current?.stop(); return; }
+    if (phase === "listening" || phase === "acknowledging") {
+      captureToken.current++;
+      recognition.current?.stop(); releaseMic(); stopSpeech();
+      setPhase("idle"); setPhaseDetail("Ascolto interrotto."); return;
+    }
     const browser = window as Window & { SpeechRecognition?: new () => Recognition; webkitSpeechRecognition?: new () => Recognition };
     const Constructor = browser.SpeechRecognition || browser.webkitSpeechRecognition;
-    if (!Constructor) { setPhase("error"); setPhaseDetail("Questo browser non supporta il riconoscimento vocale. Tocca Approfondisci sulla notizia."); return; }
     commandArticle.current = currentArticle.current || selectedArticle || visible[0] || null;
-    stopSpeech(); setTranscript(""); setPhase("listening"); setPhaseDetail("Microfono in avvio: pronuncia «approfondisci questa notizia».");
-    const mic = new Constructor(); recognition.current = mic; mic.lang = "it-IT"; mic.interimResults = true;
-    let recognized = false;
-    mic.onstart = () => { setPhase("listening"); setPhaseDetail("Ti ascolto. Pronuncia il comando adesso."); };
-    mic.onresult = event => {
-      const result = event.results[event.results.length - 1];
-      const command = result?.[0]?.transcript.trim() || "";
-      setTranscript(command);
-      if (!result?.isFinal || recognized) return;
-      recognized = true;
-      setPhase("recognized"); setPhaseDetail(`Ho capito: «${command}».`);
-      mic.stop();
-      if (/approfond|dimmi di pi[uù]|spiega|riassum/.test(command.toLocaleLowerCase("it"))) void deepen(commandArticle.current);
-      else { setPhase("error"); setPhaseDetail(`Comando «${command}» non riconosciuto. Riprova dicendo «approfondisci questa notizia».`); }
+    stopSpeech(); setTranscript(""); setPhase("acknowledging");
+    setPhaseDetail("Jarvis attiva il microfono e ti darà conferma prima di ascoltare.");
+    if (!Constructor) {
+      setPhase("error"); setPhaseDetail("Il riconoscimento vocale non è disponibile in questo browser. Usa Approfondisci qui sotto.");
+      return;
+    }
+    const token = ++captureToken.current;
+    // Request permission within the click gesture; start recognition after the spoken cue so it cannot transcribe Jarvis.
+    const streamPromise = navigator.mediaDevices?.getUserMedia?.({ audio: { echoCancellation: true, noiseSuppression: true } });
+    const startCapture = async () => {
+      if (streamPromise) {
+        try {
+          const stream = await streamPromise;
+          if (token !== captureToken.current) { stream.getTracks().forEach(track => track.stop()); return; }
+          micStreamRef.current = stream; setMicStream(stream);
+        } catch {
+          setPhase("error"); setPhaseDetail("Il microfono è bloccato. Consenti l'accesso dal browser oppure usa Approfondisci."); return;
+        }
+      }
+      if (token !== captureToken.current) return;
+      const mic = new Constructor(); recognition.current = mic; mic.lang = "it-IT"; mic.interimResults = true;
+      let recognized = false;
+      mic.onstart = () => { setPhase("listening"); setPhaseDetail("TI ASCOLTO: pronuncia «approfondisci questa notizia»."); };
+      mic.onresult = event => {
+        const result = event.results[event.results.length - 1];
+        const command = result?.[0]?.transcript.trim() || "";
+        setTranscript(command);
+        if (!result?.isFinal || recognized) return;
+        recognized = true;
+        setPhase("recognized"); setPhaseDetail(`Ho capito: «${command}».`);
+        mic.stop();
+        if (/approfond|dimmi di pi[uù]|spiega|riassum/.test(command.toLocaleLowerCase("it"))) void deepen(commandArticle.current);
+        else { setPhase("error"); setPhaseDetail(`Comando «${command}» non riconosciuto. Riprova o usa Approfondisci.`); }
+      };
+      mic.onerror = event => { if (!recognized && token === captureToken.current) { setPhase("error"); setPhaseDetail(event.error === "not-allowed" ? "Permesso microfono negato nelle impostazioni del browser." : `Ascolto non riuscito (${event.error || "errore"}). Usa Approfondisci o riprova.`); } releaseMic(); };
+      mic.onend = () => { recognition.current = null; releaseMic(); if (!recognized && token === captureToken.current) setPhase(previous => { if (previous === "listening") { setPhaseDetail("Non ho sentito un comando. Tocca il microfono e riprova."); return "error"; } return previous; }); };
+      try { mic.start(); } catch { releaseMic(); setPhase("error"); setPhaseDetail("Impossibile avviare il riconoscimento vocale. Usa Approfondisci."); }
     };
-    mic.onerror = event => { if (!recognized) { setPhase("error"); setPhaseDetail(event.error === "not-allowed" ? "Permesso microfono negato. Abilitalo nelle impostazioni del browser." : `Ascolto non riuscito (${event.error || "errore"}). Riprova o usa Approfondisci.`); } };
-    mic.onend = () => { recognition.current = null; if (!recognized) setPhase(previous => { if (previous === "listening") { setPhaseDetail("Non ho sentito un comando. Tocca il microfono e riprova."); return "error"; } return previous; }); };
-    try { mic.start(); } catch { setPhase("error"); setPhaseDetail("Impossibile avviare il microfono. Usa il pulsante Approfondisci."); }
+    if (!("speechSynthesis" in window)) { void startCapture(); return; }
+    let finished = false;
+    const readyToListen = () => { if (finished) return; finished = true; void startCapture(); };
+    const cue = new SpeechSynthesisUtterance("Ti ascolto. Dimmi quale notizia vuoi approfondire.");
+    cue.lang = "it-IT"; cue.rate = prefs.rate;
+    cue.voice = voices.find(v => v.voiceURI === prefs.voice) || voices.find(v => v.lang.toLowerCase().startsWith("it")) || null;
+    cue.onstart = () => setPhaseDetail("Jarvis dice: «Ti ascolto». Tra poco si attiva il microfono.");
+    cue.onend = readyToListen; cue.onerror = readyToListen;
+    window.speechSynthesis.speak(cue);
+    window.setTimeout(readyToListen, 3800);
   };
   const speak = (index: number, items = visible) => {
     if (!("speechSynthesis" in window) || !items[index]) return;
@@ -248,12 +329,12 @@ export default function Home() {
       </section>
       <aside className="briefing-panel" aria-live="polite">
         <div className="panel-top"><div className="eyebrow">JARVIS AUDIO</div><span className={`audio-status status-${phase}`}><span className="live-pulse"/> {PHASE_LABELS[phase]}</span></div>
-        <VoiceScope phase={phase}/>
+        <VoiceScope phase={phase} micStream={micStream}/>
         <div className="activity-status" role="status"><strong>{PHASE_LABELS[phase]}</strong><p>{phaseDetail}</p>{transcript && <small>Hai detto: «{transcript}»</small>}</div>
         <h2>Ascolta. <em>Chiedi.</em><br/>Approfondisci.</h2>
         <p className="panel-copy">{selectedArticle ? `Notizia selezionata: ${selectedArticle.title}` : first ? `Pronto a leggere ${visible.length} notizie. Premi Ascolta o seleziona un articolo.` : "Seleziona un canale con notizie disponibili."}</p>
         <div className="player-controls"><button className="play-button" disabled={!first || !(typeof window !== "undefined" && "speechSynthesis" in window)} onClick={togglePlayback}>{speaking && !paused ? <Pause size={18} fill="currentColor"/> : <Play size={18} fill="currentColor"/>}<span>{speaking && !paused ? "Metti in pausa" : paused ? "Riprendi" : "Ascolta il briefing"}</span></button><button className="stop-button" disabled={!speaking} aria-label="Ferma ascolto" onClick={stop}><Square size={16}/></button></div>
-        <button className="voice-command" onClick={listen} disabled={!first}><Mic size={17}/>{phase === "listening" ? "Ferma ascolto" : "Parla a Jarvis"}</button>
+        <button className={`voice-command ${phase === "listening" ? "is-listening" : ""}`} onClick={listen} disabled={!first}><Mic size={17}/>{phase === "listening" || phase === "acknowledging" ? "Ferma ascolto" : "Parla a Jarvis"}</button>
         <button className="detail-command" onClick={() => void deepen(currentArticle.current || selectedArticle || first || null)} disabled={!first || ["finding","reading","summarizing"].includes(phase)}>Approfondisci la notizia selezionata</button>
         <p className="voice-hint">Tocca il microfono, attendi «TI ASCOLTO» e di': «approfondisci questa notizia».</p>
         {insight && <div className="insight-card" role="status"><strong>{insight.article.title}</strong>{insight.points ? <><small>{insight.coverage}</small>{insight.points.map((point, i) => <p key={i}>{point}</p>)}</> : <p>{insight.message}</p>}<a href={insight.sourceUrl || insight.article.link} target="_blank" rel="noopener noreferrer">Verifica sulla fonte originale <ArrowUpRight size={14}/></a></div>}
