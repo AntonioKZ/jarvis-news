@@ -5,14 +5,14 @@ Dashboard personale per notizie recenti e ascolto vocale. Temi e preferenze voca
 ## Avvio
 
 ```bash
-pnpm install
-pnpm dev
+npm install
+npm run dev
 ```
 
 ## Pubblicazione su Vercel
 
-Importare il progetto come Next.js oppure eseguire `vercel deploy` dalla cartella del progetto. La route `/api/news` usa una funzione Node.js e non richiede chiavi API. Si devono verificare le richieste ai feed esterni dall'ambiente pubblicato prima di considerare operativo il sistema.
+Il progetto esistente su Vercel è collegato al ramo `main` di questo repository. Ogni push su `main` avvia un deploy di produzione. La route `/api/news` usa una funzione Node.js e non richiede chiavi API. Verificare le richieste ai feed esterni dall'ambiente pubblicato.
 
-## Notizie
+## Notizie e voce
 
-La route prova Google News RSS e, in caso di errore, Bing News RSS. Ogni risposta riporta le fonti non raggiungibili; se tutte falliscono restituisce HTTP 503 e l'interfaccia mostra un avviso. La lettura vocale usa le voci disponibili nel browser; su Android la voce dipende anche dalle impostazioni di sintesi del dispositivo.
+La route prova Google News RSS e, in caso di errore, Bing News RSS. Se tutte le fonti falliscono restituisce HTTP 503 e l'interfaccia mostra un avviso. Jarvis evita di leggere una descrizione quando ripete il titolo. Durante il briefing il pulsante microfono interrompe la voce e ascolta il comando «approfondisci questa notizia». L'approfondimento estrae punti dal testo accessibile della fonte; se la testata impedisce la lettura automatica, mostra un messaggio e il link originale. Le voci e il riconoscimento vocale dipendono dal browser e dal dispositivo.
